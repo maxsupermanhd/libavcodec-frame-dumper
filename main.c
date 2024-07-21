@@ -9,7 +9,6 @@
 static void getRGBfromFrame(AVFrame* frame, int* or, int* og, int* ob, int x, int y);
 static void logging(const char *fmt, ...);
 static int decode_packet(struct SwsContext* swsCtx, AVPacket *pPacket, AVCodecContext *pCodecContext, AVFrame *pFrame, AVFrame *pFrameConverted);
-static void save_frame(unsigned char *buf, int wrap, int xsize, int ysize, char *filename);
 typedef struct {
 	uint8_t red;
 	uint8_t green;
@@ -23,99 +22,75 @@ typedef struct {
 static int save_png_to_file(bitmap_t *bitmap, const char *path);
 
 int main(int argc, char **argv) {
-	if (argc < 5) {
-		logging("usage %s videoPath videoBeginTime outPath hwaccel_device", argv[0]);
+	if (argc < 4) {
+		logging("usage %s videoPath videoBeginTime outPath", argv[0]);
 		return 1;
 	}
-	int64_t beginTime = atoi(argv[2]);
-	logging("begin time %ld", beginTime);
+	// int64_t beginTime = atoi(argv[2]);
 
-	enum AVHWDeviceType hwaccel_type;
-	hwaccel_type = av_hwdevice_find_type_by_name(argv[4]);
-	if (hwaccel_type == AV_HWDEVICE_TYPE_NONE) {
-		logging("Device type %s is not supported.", argv[4]);
-		logging("Available device types:");
-		while((hwaccel_type = av_hwdevice_iterate_types(hwaccel_type)) != AV_HWDEVICE_TYPE_NONE)
-			logging(" %s", av_hwdevice_get_type_name(hwaccel_type));
-		return -1;
-	}
-
-	logging("Allocating context");
-	AVFormatContext *pFormatContext = avformat_alloc_context();
-	if (!pFormatContext) {
+	AVFormatContext *formatCtx = avformat_alloc_context();
+	if (!formatCtx) {
 		logging("ERROR could not allocate memory for Format Context");
 		return -1;
 	}
 
 	logging("Opening %s", argv[1]);
-	if (avformat_open_input(&pFormatContext, argv[1], NULL, NULL) != 0) {
+	if (avformat_open_input(&formatCtx, argv[1], NULL, NULL) != 0) {
 		logging("ERROR could not open the file");
 		return -1;
 	}
-	logging("format %s, duration %lld us, bit_rate %lld", pFormatContext->iformat->name, pFormatContext->duration, pFormatContext->bit_rate);
+	logging("format %s, duration %lld us, bit_rate %lld", formatCtx->iformat->name, formatCtx->duration, formatCtx->bit_rate);
 
-	if (avformat_find_stream_info(pFormatContext, NULL) < 0) {
+	if (avformat_find_stream_info(formatCtx, NULL) < 0) {
 		logging("ERROR could not get the stream info");
 		return -1;
 	}
 
+	const AVCodec *codec = NULL;
+	AVCodecParameters *codecParams = NULL;
+	int videoStreamIndex = -1;
 
-	const AVCodec *pCodec = NULL;
-	AVCodecParameters *pCodecParameters = NULL;
-	int video_stream_index = -1;
-	int videoWidth, videoHeight;
-
-	for (int i = 0; i < pFormatContext->nb_streams; i++) {
-		AVCodecParameters *pLocalCodecParameters = NULL;
-		pLocalCodecParameters = pFormatContext->streams[i]->codecpar;
-		logging("AVStream->time_base before open coded %d/%d", pFormatContext->streams[i]->time_base.num, pFormatContext->streams[i]->time_base.den);
-		logging("AVStream->r_frame_rate before open coded %d/%d", pFormatContext->streams[i]->r_frame_rate.num, pFormatContext->streams[i]->r_frame_rate.den);
-		logging("AVStream->start_time %" PRId64, pFormatContext->streams[i]->start_time);
-		logging("AVStream->duration %" PRId64, pFormatContext->streams[i]->duration);
-
-		logging("finding the proper decoder (CODEC)");
-
-		const AVCodec *pLocalCodec = avcodec_find_decoder(pLocalCodecParameters->codec_id);
-
-		if (pLocalCodec == NULL) {
+	for (int i = 0; i < formatCtx->nb_streams; i++) {
+		codecParams = formatCtx->streams[i]->codecpar;
+		const AVCodec *foundCodec = avcodec_find_decoder(codecParams->codec_id);
+		if (foundCodec == NULL) {
 			logging("ERROR unsupported codec!");
 			continue;
 		}
-
-		if (pLocalCodecParameters->codec_type == AVMEDIA_TYPE_VIDEO) {
-			if (video_stream_index == -1) {
-				video_stream_index = i;
-				pCodec = pLocalCodec;
-				pCodecParameters = pLocalCodecParameters;
-				videoWidth = pLocalCodecParameters->width;
-				videoHeight = pLocalCodecParameters->height;
-				logging("SELECTED Video Codec: resolution %d x %d", pLocalCodecParameters->width, pLocalCodecParameters->height);
+		if (codecParams->codec_type == AVMEDIA_TYPE_VIDEO) {
+			if (videoStreamIndex == -1) {
+				videoStreamIndex = i;
+				codec = foundCodec;
+				logging("SELECTED Video Codec %d resolution %d x %d", i, codecParams->width, codecParams->height);
 			} else {
-				logging("Video Codec: resolution %d x %d", pLocalCodecParameters->width, pLocalCodecParameters->height);
+				logging("Video Codec %d resolution %d x %d", i, codecParams->width, codecParams->height);
 			}
-		} else if (pLocalCodecParameters->codec_type == AVMEDIA_TYPE_AUDIO) {
-			logging("Audio Codec: sample rate %d", pLocalCodecParameters->sample_rate);
 		}
-		logging("\tCodec %s ID %d bit_rate %lld", pLocalCodec->name, pLocalCodec->id, pLocalCodecParameters->bit_rate);
 	}
 
-	if (video_stream_index == -1) {
+	if (videoStreamIndex == -1) {
 		logging("File %s does not contain a video stream!", argv[1]);
 		return -1;
 	}
+	AVStream *video = formatCtx->streams[videoStreamIndex];
 
-	AVCodecContext *pCodecContext = avcodec_alloc_context3(pCodec);
-	if (!pCodecContext) {
+	if (video->codecpar->format != AV_PIX_FMT_YUV420P) {
+		logging("Wrong video pixel format: %d", video->codecpar->format);
+		return -1;
+	}
+
+	AVCodecContext *codecCtx = avcodec_alloc_context3(codec);
+	if (!codecCtx) {
 		logging("failed to allocated memory for AVCodecContext");
 		return -1;
 	}
 
-	if (avcodec_parameters_to_context(pCodecContext, pCodecParameters) < 0) {
+	if (avcodec_parameters_to_context(codecCtx, codecParams) < 0) {
 		logging("failed to copy codec params to codec context");
 		return -1;
 	}
 
-	if (avcodec_open2(pCodecContext, pCodec, NULL) < 0) {
+	if (avcodec_open2(codecCtx, codec, NULL) < 0) {
 		logging("failed to open codec through avcodec_open2");
 		return -1;
 	}
@@ -130,33 +105,33 @@ int main(int argc, char **argv) {
 		logging("failed to allocate memory for AVFrame");
 		return -1;
 	}
-	pFrameConverted->width = videoWidth;
-	pFrameConverted->height = videoHeight;
+	pFrameConverted->width = video->codecpar->width;
+	pFrameConverted->height = video->codecpar->height;
 	pFrameConverted->format = AV_PIX_FMT_RGB24;
 	if (av_frame_get_buffer(pFrameConverted, 0)) {
 		logging("failed to allocate frame buffer");
 		return -1;
 	}
-	AVPacket *pPacket = av_packet_alloc();
-	if (!pPacket) {
+	AVPacket *packet = av_packet_alloc();
+	if (!packet) {
 		logging("failed to allocate memory for AVPacket");
 		return -1;
 	}
 
 	struct SwsContext* swsCtx = sws_getContext(
-		videoWidth, videoHeight, AV_PIX_FMT_YUV420P,
-		videoWidth, videoHeight, AV_PIX_FMT_RGB24,
+		video->codecpar->width, video->codecpar->height, AV_PIX_FMT_YUV420P,
+		video->codecpar->width, video->codecpar->height, AV_PIX_FMT_RGB24,
 		0, 0, 0, 0);
 
 	int response = 0;
 
-	while (av_read_frame(pFormatContext, pPacket) >= 0) {
-		if (pPacket->stream_index == video_stream_index) {
-			response = decode_packet(swsCtx, pPacket, pCodecContext, pFrame, pFrameConverted);
+	while (av_read_frame(formatCtx, packet) >= 0) {
+		if (packet->stream_index == videoStreamIndex) {
+			response = decode_packet(swsCtx, packet, codecCtx, pFrame, pFrameConverted);
 			if (response < 0)
 				break;
 		}
-		av_packet_unref(pPacket);
+		av_packet_unref(packet);
 	}
 
 	logging("Done");
@@ -166,15 +141,15 @@ int main(int argc, char **argv) {
 uint64_t lastReport = 0;
 uint64_t lastFrame = 0;
 
-static int decode_packet(struct SwsContext* swsCtx, AVPacket *pPacket, AVCodecContext *pCodecContext, AVFrame *pFrame, AVFrame *pFrameConverted) {
-	int response = avcodec_send_packet(pCodecContext, pPacket);
+static int decode_packet(struct SwsContext* swsCtx, AVPacket *packet, AVCodecContext *codecCtx, AVFrame *frame, AVFrame *frameConverted) {
+	int response = avcodec_send_packet(codecCtx, packet);
 	if (response < 0) {
 		logging("Error while sending a packet to the decoder: %s", av_err2str(response));
 		return response;
 	}
 
 	while (response >= 0) {
-		response = avcodec_receive_frame(pCodecContext, pFrame);
+		response = avcodec_receive_frame(codecCtx, frame);
 		if (response == AVERROR(EAGAIN) || response == AVERROR_EOF) {
 			break;
 		} else if (response < 0) {
@@ -190,19 +165,17 @@ static int decode_packet(struct SwsContext* swsCtx, AVPacket *pPacket, AVCodecCo
 		if (currTime - lastReport >= 1) {
 			logging(
 				"Frame %08d FPS %03d (type=%c, size=%d bytes, format=%d) pts %d key_frame %d",
-				pCodecContext->frame_num,
-				pCodecContext->frame_num-lastFrame,
-				av_get_picture_type_char(pFrame->pict_type),
-				pFrame->pkt_size,
-				pFrame->format,
-				pFrame->pts,
-				pFrame->key_frame
+				codecCtx->frame_num,
+				codecCtx->frame_num-lastFrame,
+				av_get_picture_type_char(frame->pict_type),
+				frame->pkt_size,
+				frame->format,
+				frame->pts,
+				frame->key_frame
 			);
-			lastFrame = pCodecContext->frame_num;
+			lastFrame = codecCtx->frame_num;
 			lastReport = currTime;
 		}
-
-		// AV_PIX_FMT_YUV410P
 
 		// const uint8_t* srcSlice[] = { pFrame->data[0], pFrame->data[1], pFrame->data[2] };
 		// const int srcStride[] = { pFrame->linesize[0], pFrame->linesize[1], pFrame->linesize[2] };
@@ -268,17 +241,6 @@ static void getRGBfromFrame(AVFrame* frame, int* or, int* og, int* ob, int x, in
 	*or = r;
 	*og = g;
 	*ob = b;
-}
-
-static void save_frame(unsigned char *buf, int wrap, int xsize, int ysize, char *filename) {
-	FILE *f;
-	int i;
-	f = fopen(filename, "w");
-	fprintf(f, "P6\n%d %d\n%d\n", xsize, ysize, 255);
-
-	for (i = 0; i < ysize; i++)
-		fwrite(buf + i * wrap, 3, xsize, f);
-	fclose(f);
 }
 
 static pixel_t * pixel_at (bitmap_t * bitmap, int x, int y) {
