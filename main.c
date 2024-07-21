@@ -6,9 +6,14 @@
 #include <png.h>
 #include <time.h>
 
+int64_t videoBeginTime = 0;
+uint64_t videoNumberOfFrames = 0;
+const char* outPrefix;
+uint64_t saveFromFrame;
+
 static void getRGBfromFrame(AVFrame* frame, int* or, int* og, int* ob, int x, int y);
 static void logging(const char *fmt, ...);
-static int decode_packet(struct SwsContext* swsCtx, AVPacket *pPacket, AVCodecContext *pCodecContext, AVFrame *pFrame, AVFrame *pFrameConverted);
+static int decodePacket(struct SwsContext* swsCtx, AVPacket *pPacket, AVCodecContext *pCodecContext, AVFrame *pFrame, AVFrame *pFrameConverted);
 typedef struct {
 	uint8_t red;
 	uint8_t green;
@@ -22,17 +27,21 @@ typedef struct {
 static int save_png_to_file(bitmap_t *bitmap, const char *path);
 
 int main(int argc, char **argv) {
-	if (argc < 4) {
-		logging("usage %s videoPath videoBeginTime outPath", argv[0]);
+	if (argc < 5) {
+		logging("usage %s videoPath videoBeginTime outPath seekToFrame", argv[0]);
 		return 1;
 	}
-	// int64_t beginTime = atoi(argv[2]);
+	videoBeginTime = atoi(argv[2]);
+	outPrefix = argv[3];
+	saveFromFrame = atoi(argv[4]);
 
 	AVFormatContext *formatCtx = avformat_alloc_context();
 	if (!formatCtx) {
 		logging("ERROR could not allocate memory for Format Context");
 		return -1;
 	}
+
+	formatCtx->flags |= AVFMT_FLAG_GENPTS;
 
 	logging("Opening %s", argv[1]);
 	if (avformat_open_input(&formatCtx, argv[1], NULL, NULL) != 0) {
@@ -74,6 +83,12 @@ int main(int argc, char **argv) {
 	}
 	AVStream *video = formatCtx->streams[videoStreamIndex];
 
+	int tS = (video->nb_frames/60)%60;
+	int tM = (video->nb_frames/60/60)%60;
+	int tH = (video->nb_frames/60/60/60);
+	videoNumberOfFrames = video->nb_frames;
+	logging("Video length: %d frames (%02dh%02dm%02ds)", video->nb_frames, tH, tM, tS);
+
 	if (video->codecpar->format != AV_PIX_FMT_YUV420P) {
 		logging("Wrong video pixel format: %d", video->codecpar->format);
 		return -1;
@@ -84,6 +99,9 @@ int main(int argc, char **argv) {
 		logging("failed to allocated memory for AVCodecContext");
 		return -1;
 	}
+
+	codecCtx->thread_count = 16;
+	codecCtx->thread_type = FF_THREAD_FRAME;
 
 	if (avcodec_parameters_to_context(codecCtx, codecParams) < 0) {
 		logging("failed to copy codec params to codec context");
@@ -127,7 +145,7 @@ int main(int argc, char **argv) {
 
 	while (av_read_frame(formatCtx, packet) >= 0) {
 		if (packet->stream_index == videoStreamIndex) {
-			response = decode_packet(swsCtx, packet, codecCtx, pFrame, pFrameConverted);
+			response = decodePacket(swsCtx, packet, codecCtx, pFrame, pFrameConverted);
 			if (response < 0)
 				break;
 		}
@@ -140,8 +158,11 @@ int main(int argc, char **argv) {
 
 uint64_t lastReport = 0;
 uint64_t lastFrame = 0;
+uint8_t lastPixR = 0;
+uint8_t lastPixG = 0;
+uint8_t lastPixB = 0;
 
-static int decode_packet(struct SwsContext* swsCtx, AVPacket *packet, AVCodecContext *codecCtx, AVFrame *frame, AVFrame *frameConverted) {
+static int decodePacket(struct SwsContext* swsCtx, AVPacket *packet, AVCodecContext *codecCtx, AVFrame *frame, AVFrame *frameConverted) {
 	int response = avcodec_send_packet(codecCtx, packet);
 	if (response < 0) {
 		logging("Error while sending a packet to the decoder: %s", av_err2str(response));
@@ -157,52 +178,50 @@ static int decode_packet(struct SwsContext* swsCtx, AVPacket *packet, AVCodecCon
 			return response;
 		}
 
-		if (response < 0) {
-			continue;
-		}
-
 		uint64_t currTime = time(NULL);
 		if (currTime - lastReport >= 1) {
-			logging(
-				"Frame %08d FPS %03d (type=%c, size=%d bytes, format=%d) pts %d key_frame %d",
-				codecCtx->frame_num,
-				codecCtx->frame_num-lastFrame,
-				av_get_picture_type_char(frame->pict_type),
-				frame->pkt_size,
-				frame->format,
-				frame->pts,
-				frame->key_frame
-			);
+			int tS = (codecCtx->frame_num/60)%60;
+			int tM = (codecCtx->frame_num/60/60)%60;
+			int tH = (codecCtx->frame_num/60/60/60);
+			int fps = codecCtx->frame_num-lastFrame;
+			int eS = (((videoNumberOfFrames-codecCtx->frame_num)/fps))%60;
+			int eM = (((videoNumberOfFrames-codecCtx->frame_num)/fps)/60)%60;
+			int eH = (((videoNumberOfFrames-codecCtx->frame_num)/fps)/60/60);
+			logging("Frame % 8d (%02dh%02dm%02ds) FPS % 5d (ETA %02dh%02dm%02ds)", codecCtx->frame_num, tH, tM, tS, fps, eH, eM, eS);
 			lastFrame = codecCtx->frame_num;
 			lastReport = currTime;
 		}
 
-		// const uint8_t* srcSlice[] = { pFrame->data[0], pFrame->data[1], pFrame->data[2] };
-		// const int srcStride[] = { pFrame->linesize[0], pFrame->linesize[1], pFrame->linesize[2] };
-		// int srcSliceY = 0;
-		// int srcSliceH = pFrame->height;
-		// uint8_t* dst[] = { pFrameConverted->data[0], pFrameConverted->data[1], pFrameConverted->data[2] };
-		// int dstStride[] = { pFrameConverted->linesize[0], pFrameConverted->linesize[1], pFrameConverted->linesize[2] };
+		int r, g, b;
+		getRGBfromFrame(frame, &r, &g, &b, 1856, 799);
 
-		// sws_scale(swsCtx, srcSlice, srcStride, srcSliceY, srcSliceH, dst, dstStride);
+		if (codecCtx->frame_num > saveFromFrame) {
+			if (r < 25 && g < 25 && b < 25 && lastPixR < 130 && lastPixG > 180 && lastPixB < 160) {
+				const uint8_t* srcSlice[] = { frame->data[0], frame->data[1], frame->data[2] };
+				const int srcStride[] = { frame->linesize[0], frame->linesize[1], frame->linesize[2] };
+				uint8_t* dst[] = { frameConverted->data[0], frameConverted->data[1], frameConverted->data[2] };
+				int dstStride[] = { frameConverted->linesize[0], frameConverted->linesize[1], frameConverted->linesize[2] };
 
-		// int r, g, b;
-		// int cx = 0, cy = 0;
-		// getRGBfromFrame(pFrame, &r, &g, &b, cx, cy);
+				sws_scale(swsCtx, srcSlice, srcStride, 0, frame->height, dst, dstStride);
 
-		// logging("% 4d", r);
-		// logging("% 4d", g);
-		// logging("% 4d", b);
+				char frame_filename[1024];
+				int tS = (codecCtx->frame_num/60)%60;
+				int tM = (codecCtx->frame_num/60/60)%60;
+				int tH = (codecCtx->frame_num/60/60/60);
+				logging("Saving frame % 8d (%02dh%02dm%02ds)", codecCtx->frame_num, tH, tM, tS);
+				snprintf(frame_filename, sizeof(frame_filename), "%s/%ld.png", outPrefix, videoBeginTime + codecCtx->frame_num/60);
+				bitmap_t btm = {
+					.pixels = (pixel_t*)frameConverted->data[0],
+					.width = frame->width,
+					.height = frame->height,
+				};
+				save_png_to_file(&btm, frame_filename);
+			}
+		}
 
-		// char frame_filename[1024];
-		// snprintf(frame_filename, sizeof(frame_filename), "%ld.png", pCodecContext->frame_num);
-		// bitmap_t btm = {
-		// 	.pixels = (pixel_t*)pFrameConverted->data[0],
-		// 	.width = pFrame->width,
-		// 	.height = pFrame->height,
-		// };
-		// save_png_to_file(&btm, frame_filename);
-		// save_frame(pFrame->data[0], pFrame->linesize[0], pFrame->width, pFrame->height, frame_filename);
+		lastPixR = r;
+		lastPixG = g;
+		lastPixB = b;
 	}
 	return 0;
 }
@@ -214,12 +233,18 @@ static void getRGBfromFrame(AVFrame* frame, int* or, int* og, int* ob, int x, in
 	int yIndex = y * frame->linesize[0] + x;
 	int uIndex = (y / 2) * frame->linesize[1] + (x / 2);
 	int vIndex = (y / 2) * frame->linesize[2] + (x / 2);
-	int yValue = yPlane[yIndex];
-	int uValue = uPlane[uIndex];
-	int vValue = vPlane[vIndex];
-	int r = yValue + 1.402 * (vValue - 128);
-	int g = yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128);
-	int b = yValue + 1.772 * (uValue - 128);
+	double yValue = yPlane[yIndex];
+	double uValue = uPlane[uIndex];
+	double vValue = vPlane[vIndex];
+	yValue -= 16;
+	uValue -= 128;
+	vValue -= 128;
+	double r = 1.164 * yValue                  + 1.596 * vValue;
+	double g = 1.164 * yValue - 0.392 * uValue - 0.813 * vValue;
+	double b = 1.164 * yValue + 2.017 * uValue;
+	// int r = yValue + 1.402 * (vValue - 128);
+	// int g = yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128);
+	// int b = yValue + 1.772 * (uValue - 128);
 	if (r < 0) {
 		r = 0;
 	}
@@ -238,9 +263,9 @@ static void getRGBfromFrame(AVFrame* frame, int* or, int* og, int* ob, int x, in
 	if (b > 255) {
 		b = 255;
 	}
-	*or = r;
-	*og = g;
-	*ob = b;
+	*or = round(r);
+	*og = round(g);
+	*ob = round(b);
 }
 
 static pixel_t * pixel_at (bitmap_t * bitmap, int x, int y) {
