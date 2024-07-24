@@ -28,7 +28,7 @@ static int save_png_to_file(bitmap_t *bitmap, const char *path);
 
 int main(int argc, char **argv) {
 	if (argc < 5) {
-		logging("usage %s videoPath videoBeginTime outPath seekToFrame", argv[0]);
+		logging("usage %s videoPath videoBeginTime outPath saveFromFrame", argv[0]);
 		return 1;
 	}
 	videoBeginTime = atoi(argv[2]);
