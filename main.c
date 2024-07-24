@@ -27,8 +27,8 @@ typedef struct {
 static int save_png_to_file(bitmap_t *bitmap, const char *path);
 
 int main(int argc, char **argv) {
-	if (argc < 5) {
-		logging("usage %s videoPath videoBeginTime outPath seekToFrame", argv[0]);
+	if (argc < 4) {
+		logging("usage %s videoPath videoBeginTime outPath", argv[0]);
 		return 1;
 	}
 	videoBeginTime = atoi(argv[2]);
